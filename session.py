@@ -137,6 +137,11 @@ class Session:
         self._queued_prompts: List[str] = []
         # Track if inject was sent (to skip "done" status until inject query completes)
         self._inject_pending: bool = False
+        # Buffer for coalescing background-task notifications. Multiple bg tasks
+        # finishing close together are combined into a single wake to avoid
+        # spamming the conversation and racing with user input.
+        self._pending_bg_notifications: List[str] = []
+        self._bg_flush_scheduled: bool = False
 
         # Extract subsession_id and parent_view_id if provided
         if initial_context:
@@ -713,6 +718,33 @@ class Session:
         self._animate()
         self.start(resume_session_at=rewind_id)
 
+    @staticmethod
+    def _is_synthetic_turn(prompt: str) -> bool:
+        """Detect prompts that aren't real user messages (bg-task wakes, retain
+        injections, interruption markers, channel/subsession events, …) so the
+        undo quick panel doesn't list them as rewind targets."""
+        if not prompt:
+            return True
+        first = prompt.lstrip().split("\n", 1)[0]
+        # XML-tagged synthetic blocks: <task-notification>, <channel>, <wake>,
+        # <subsession>, <inject>, <timer>, etc.
+        if first.startswith("<") and ">" in first:
+            tag = first[1:first.index(">")].split()[0].lstrip("/")
+            if tag in {
+                "task-notification", "channel", "subsession",
+                "wake", "inject", "timer", "notification", "retain",
+            }:
+                return True
+        # Bracketed synthetic markers
+        synthetic_brackets = (
+            "[Request interrupted",
+            "[retain context]",
+            "[Loop]",
+        )
+        if any(first.startswith(p) for p in synthetic_brackets):
+            return True
+        return False
+
     def get_turns_for_undo(self) -> list:
         """Return [(label, rewind_id, draft_prompt)] for all undoable turns, newest first."""
         turns = self._read_turns()
@@ -720,6 +752,8 @@ class Session:
         for i, (prompt, prev_asst_uuid) in enumerate(turns):
             if not prev_asst_uuid:
                 continue  # first turn with no prior assistant — can't rewind here
+            if self._is_synthetic_turn(prompt):
+                continue  # bg notifications / interrupts / retain injects: not useful as rewind targets
             first_line = prompt.split("\n")[0][:72]
             label = f"{i + 1} — {first_line}" if first_line else f"{i + 1} — (empty)"
             result.append((label, prev_asst_uuid, prompt))
@@ -771,6 +805,8 @@ class Session:
     def _find_rewind_point(self) -> tuple:
         """Find the assistant entry uuid to rewind to (before last visible turn).
         Respects current _pending_resume_at to support consecutive undos.
+        Skips synthetic turns (bg-task wakes, interrupts, retain injects) so
+        undo lands on the user's last real message.
         Returns (uuid, undone_prompt) or (None, "") if can't rewind."""
         turns = self._read_turns()
         if not turns:
@@ -778,18 +814,26 @@ class Session:
         if self._pending_resume_at:
             for i, (prompt, asst_uuid) in enumerate(turns):
                 if asst_uuid == self._pending_resume_at:
-                    if i < 2:
+                    # Walk back over synthetic turns to find the previous real one.
+                    j = i - 1
+                    while j >= 0 and self._is_synthetic_turn(turns[j][0]):
+                        j -= 1
+                    if j < 1:
                         return None, ""
-                    undone_prompt = turns[i - 1][0]
-                    rewind_to = turns[i - 1][1]
+                    undone_prompt = turns[j][0]
+                    rewind_to = turns[j][1]
                     if not rewind_to:
                         return None, ""
                     return rewind_to, undone_prompt
             return None, ""
-        if len(turns) < 2:
+        # Pick the most recent non-synthetic turn as the undo target.
+        idx = len(turns) - 1
+        while idx >= 0 and self._is_synthetic_turn(turns[idx][0]):
+            idx -= 1
+        if idx < 1:
             return None, ""
-        undone_prompt = turns[-1][0]
-        rewind_to = turns[-1][1]
+        undone_prompt = turns[idx][0]
+        rewind_to = turns[idx][1]
         if not rewind_to:
             return None, ""
         return rewind_to, undone_prompt
@@ -995,6 +1039,8 @@ class Session:
     def _clear_deferred_state(self) -> None:
         """Clear deferred action state. Called on error/interrupt."""
         self._queued_prompts.clear()
+        self._pending_bg_notifications.clear()
+        self._bg_flush_scheduled = False
         self._inject_pending = False
         self._pending_retain = None
         self._input_mode_entered = False  # Allow re-entry to input mode
@@ -1682,16 +1728,27 @@ class Session:
         task_id = data.get("task_id", "")
         status = data.get("status", "")
         tool_use_id = self._task_tool_map.pop(task_id, None)
-        if not (tool_use_id and status == "completed"):
+        if not status:
             return
-        tool = self.output.find_tool_by_id(tool_use_id)
-        if not (tool and tool.status == "background"):
+        # User-initiated kills don't need a wake — agent already knows it
+        # interrupted, and waking just spams the conversation.
+        if status in ("stopped", "killed"):
+            tool = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
+            if tool and tool.status == "background":
+                from .output import ERROR
+                old_status = tool.status
+                tool.status = ERROR
+                self.output._patch_tool_symbol(tool, old_status)
             return
-        from .output import DONE
-        old_status = tool.status
-        tool.status = DONE
-        self.output._patch_tool_symbol(tool, old_status)
-        # Feed result back to agent
+        # Update tool UI from BACKGROUND → DONE/ERROR if we can find it. The
+        # notification still fires even if tool tracking is lost.
+        tool = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
+        if tool and tool.status == "background":
+            from .output import DONE, ERROR
+            old_status = tool.status
+            tool.status = DONE if status == "completed" else ERROR
+            self.output._patch_tool_symbol(tool, old_status)
+        # Build the notification block
         output = ""
         output_file = data.get("output_file", "")
         if output_file:
@@ -1701,14 +1758,33 @@ class Session:
             except Exception as e:
                 print(f"[Claude] task notification output read failed ({output_file}): {e}")
         summary = data.get("summary", "")
-        wake_prompt = (
-            f"<task-notification>{summary}\n{output}</task-notification>"
-            if output else f"<task-notification>{summary}</task-notification>"
+        header = f"{summary} [{status}]" if status != "completed" else summary
+        block = (
+            f"<task-notification>{header}\n{output}</task-notification>"
+            if output else f"<task-notification>{header}</task-notification>"
         )
+        # Coalesce: append to buffer and schedule a debounced flush. Multiple
+        # bg tasks finishing within the window are sent as a single wake.
+        self._pending_bg_notifications.append(block)
+        if not self._bg_flush_scheduled:
+            self._bg_flush_scheduled = True
+            sublime.set_timeout(self._flush_bg_notifications, 400)
+
+    def _flush_bg_notifications(self) -> None:
+        """Flush coalesced bg-task notifications into a single wake prompt."""
+        self._bg_flush_scheduled = False
+        if not self._pending_bg_notifications:
+            return
+        blocks = self._pending_bg_notifications
+        self._pending_bg_notifications = []
+        wake_prompt = "\n".join(blocks)
+        # Display: short single-line summary regardless of how many merged
+        n = len(blocks)
+        display = f"{BACKGROUND_PREFIX}{n} task notification{'s' if n != 1 else ''}"
         if self.working:
             self._queued_prompts.append(wake_prompt)
         else:
-            self.query(wake_prompt, display_prompt=f"{BACKGROUND_PREFIX}{summary}", silent=True)
+            self.query(wake_prompt, display_prompt=display, silent=True)
 
     def _set_name(self, name: str) -> None:
         """Set session name and update UI."""
