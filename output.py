@@ -193,7 +193,13 @@ class OutputView:
             (self.pending_question and self.pending_question.callback) or
             (self.pending_plan and self.pending_plan.callback)
         )
-        is_working = self.current and self.current.working
+        # Tab title reflects the session-level working flag so silent wake-up
+        # queries (bg-task notifications, retain injects, …) still show ◉
+        # even though no visible Conversation was opened for them.
+        is_working = (
+            (session and session.working)
+            or (self.current and self.current.working)
+        )
         if is_sleeping:
             prefix = "⏸ "
         elif is_questioning:

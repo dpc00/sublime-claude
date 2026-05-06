@@ -907,7 +907,12 @@ class Session:
             if not self.name:
                 self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
             self.output.prompt(ui_prompt, context_names)
-            self._animate()
+        # Always show busy indicator: flip tab title now and start the spinner
+        # loop. Silent queries (bg-task wakes, retain injects, …) still need a
+        # visible cue that the session is processing, even though the user
+        # prompt itself isn't rendered.
+        self.output._update_title()
+        self._animate()
         query_params = {"prompt": full_prompt}
         if hasattr(self, '_pending_images') and self._pending_images:
             query_params["images"] = self._pending_images
