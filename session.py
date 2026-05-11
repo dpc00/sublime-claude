@@ -2,7 +2,7 @@
 import json
 import os
 import time
-from typing import Optional, List, Dict, Callable
+from typing import Optional, List, Dict, Callable, Any
 
 import sublime
 
@@ -127,11 +127,13 @@ class Session:
         self._pending_resume_at: Optional[str] = None  # Set by undo, consumed by next query
         # Background task tracking: task_id → tool_use_id
         self._task_tool_map: Dict[str, str] = {}
-        # Tool-use IDs we know were started with run_in_background=true.
-        # Authoritative for "should this task_notification fire a wake?" —
-        # survives conversation-history truncation (HISTORY_CAP), so old bg
-        # tasks still notify the agent when they finally finish.
-        self._bg_tool_use_ids: set = set()
+        # Tool-use IDs we know were started with run_in_background=true,
+        # mapped to the ToolCall object. Authoritative for "should this
+        # task_notification fire a wake?" — survives conversation-history
+        # truncation (HISTORY_CAP), and the held ToolCall reference keeps
+        # the object alive so the ⚙ → ✓/✗ symbol patch can still happen
+        # after the owning Conversation has been dropped.
+        self._bg_tools: Dict[str, Any] = {}
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
         # Callback for channel mode responses
@@ -915,7 +917,15 @@ class Session:
         # Always show busy indicator: flip tab title now and start the spinner
         # loop. Silent queries (bg-task wakes, retain injects, …) still need a
         # visible cue that the session is processing, even though the user
-        # prompt itself isn't rendered.
+        # prompt itself isn't rendered. The previous turn's meta() flipped
+        # self.output.current.working=False; re-arm it so advance_spinner
+        # actually re-renders the ⠋ line at the bottom of the conversation.
+        if silent and self.output.current is not None:
+            self.output.current.working = True
+            # Hide the previous turn's @done(…) line while this wake processes;
+            # meta() of the wake result will set a fresh duration on completion.
+            self.output.current.duration = 0
+            self.output._render_current()
         self.output._update_title()
         self._animate()
         query_params = {"prompt": full_prompt}
@@ -1260,12 +1270,26 @@ class Session:
             return
         try:
             from .output import BACKGROUND, ERROR
-            bg = self.output.active_background_tools()
+            # Union of currently-visible bg tools and any we've tracked across
+            # history truncation. Use object identity to avoid double-patching.
+            seen = set()
+            bg = []
+            for tool in self.output.active_background_tools():
+                if id(tool) not in seen:
+                    seen.add(id(tool))
+                    bg.append(tool)
+            for tool in self._bg_tools.values():
+                if tool is not None and id(tool) not in seen:
+                    seen.add(id(tool))
+                    bg.append(tool)
             for tool in bg:
                 old_status = tool.status
+                if old_status != BACKGROUND:
+                    continue
                 tool.status = ERROR
                 tool.result = f"(aborted: {reason})"
                 self.output._patch_tool_symbol(tool, old_status)
+            self._bg_tools.clear()
             if bg:
                 print(f"[Claude] aborted {len(bg)} background tool(s): {reason}")
         except Exception as e:
@@ -1637,9 +1661,13 @@ class Session:
             return
         if background:
             # Background tools don't take over current_tool (spinner stays on foreground)
-            if tool_id:
-                self._bg_tool_use_ids.add(tool_id)
             self.output.tool(name, tool_input, tool_id=tool_id, background=True)
+            if tool_id:
+                # Hold the ToolCall reference so the symbol patch can still fire
+                # after this turn's Conversation is dropped from history.
+                tc = self.output.find_tool_by_id(tool_id)
+                if tc is not None:
+                    self._bg_tools[tool_id] = tc
             self._update_status_bar()
             return
         if self.current_tool and self.current_tool.strip():
@@ -1755,12 +1783,11 @@ class Session:
         # Authoritative gate: only fire wake for tools we know were started
         # with run_in_background=true. Survives conversation-history truncation
         # so a bg task that finishes much later still notifies the agent.
-        if tool_use_id not in self._bg_tool_use_ids:
+        if tool_use_id not in self._bg_tools:
             return
-        self._bg_tool_use_ids.discard(tool_use_id)
-        # Update tool UI from BACKGROUND → DONE/ERROR if the tool object is
-        # still in the (possibly truncated) conversation history.
-        tool = self.output.find_tool_by_id(tool_use_id)
+        # Pop the ToolCall reference; prefer it over find_tool_by_id, which
+        # returns None after HISTORY_CAP drops the owning Conversation.
+        tool = self._bg_tools.pop(tool_use_id) or self.output.find_tool_by_id(tool_use_id)
         if tool and tool.status == "background":
             from .output import DONE, ERROR
             old_status = tool.status

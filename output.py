@@ -691,7 +691,12 @@ class OutputView:
         return any(e is target for e in self.current.events)
 
     def _patch_tool_symbol(self, target: ToolCall, old_status: str) -> None:
-        """Patch a tool's symbol in-place in the view (for previous conversations)."""
+        """Patch a tool's symbol in-place in the view (for previous conversations).
+
+        Uses tool_input snippets (command/file_path/etc.) as a disambiguator
+        so N concurrent same-name tools each find their own line — without
+        this, all matches collapse to whichever line was rendered first.
+        """
         if not self.view:
             return
         old_sym = self.SYMBOLS.get(old_status, "☐")
@@ -699,12 +704,27 @@ class OutputView:
         if old_sym == new_sym:
             return
         content = self.view.substr(sublime.Region(0, self.view.size()))
-        # Find the tool line: "  ⚙ ToolName: ..." and replace the symbol
         import re
-        pattern = re.escape(f"  {old_sym} {target.name}")
-        for m in re.finditer(pattern, content):
+        # Build a disambiguating snippet from tool_input. First-line only,
+        # capped to keep regex sane and avoid matching across result lines.
+        snippet = ""
+        for key in ("command", "file_path", "pattern", "url", "task_id", "description"):
+            val = target.tool_input.get(key) if isinstance(target.tool_input, dict) else None
+            if isinstance(val, str) and val.strip():
+                snippet = val.split("\n", 1)[0][:120]
+                break
+        prefix = f"  {old_sym} {target.name}"
+        if snippet:
+            # Look for "  ⚙ Bash: {cmd-snippet}" — `re.escape` handles regex metas in cmd
+            pattern = re.escape(prefix) + r"[^\n]*?" + re.escape(snippet)
+        else:
+            pattern = re.escape(prefix)
+        m = re.search(pattern, content)
+        if m is None and snippet:
+            # Fallback: tool_input changed or detail formatter renamed — try plain prefix
+            m = re.search(re.escape(prefix), content)
+        if m is not None:
             self._replace(m.start() + 2, m.start() + 2 + len(old_sym), new_sym)
-            return
 
     def tool_done(self, name: str, result: str = None, tool_id: str = None) -> None:
         """Mark tool as done. Prefer tool_id match, fall back to name+PENDING."""
@@ -923,6 +943,34 @@ class OutputView:
             if had_pending:
                 self.current.events.append("\n\n*[session reconnected]*\n")
                 self._render_current()
+
+        # Patch stale background-tool symbols in the view text. After Sublime
+        # restart, ToolCall objects for old turns are gone, but the view text
+        # still shows ⚙ for bg tasks whose subprocesses died with the previous
+        # bridge. Convert them to ✘ so they don't look in-progress forever.
+        if self.view:
+            bg_sym = self.SYMBOLS["background"]
+            err_sym = self.SYMBOLS["error"]
+            content = self.view.substr(sublime.Region(0, self.view.size()))
+            marker = f"  {bg_sym} "
+            replacement = f"  {err_sym} "
+            idx = 0
+            edits: list = []
+            while True:
+                pos = content.find(marker, idx)
+                if pos < 0:
+                    break
+                # Only patch the symbol char itself
+                sym_start = pos + 2
+                sym_end = sym_start + len(bg_sym)
+                edits.append((sym_start, sym_end))
+                idx = pos + len(marker)
+            # Apply right-to-left so earlier offsets stay valid
+            if edits:
+                self.view.set_read_only(False)
+                for sym_start, sym_end in reversed(edits):
+                    self.view.run_command("claude_replace", {"start": sym_start, "end": sym_end, "text": err_sym})
+                self.view.set_read_only(True)
 
     def _remove_permission_block(self) -> None:
         """Remove permission block from view without callback."""
