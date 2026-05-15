@@ -225,6 +225,22 @@ class DeepSeekStartCommand(sublime_plugin.WindowCommand):
         create_session(self.window, backend="deepseek")
 
 
+class PiStartCommand(sublime_plugin.WindowCommand):
+    """Start a new Pi session."""
+    def run(self) -> None:
+        import shutil
+        # Check bun global install first
+        bun_pi = os.path.expanduser("~/.bun/install/global/node_modules/.bin/pi")
+        if not os.path.isfile(bun_pi) and not shutil.which("pi"):
+            sublime.error_message(
+                "Pi CLI not found.\n\n"
+                "Install: npm install -g @earendil-works/pi-coding-agent\n\n"
+                "Then authenticate with: pi (and follow /login)"
+            )
+            return
+        create_session(self.window, backend="pi")
+
+
 class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
     """Open input for query (focuses output and enters input mode)."""
     def run(self) -> None:
@@ -1088,6 +1104,21 @@ class ClaudeWakeSessionCommand(sublime_plugin.WindowCommand):
         return session is not None and session.is_sleeping
 
 
+class ClaudeToggleSubmitModeCommand(sublime_plugin.ApplicationCommand):
+    """Toggle whether Enter or Cmd/Ctrl+Enter submits the input."""
+    def run(self):
+        s = sublime.load_settings("ClaudeCode.sublime-settings")
+        cur = bool(s.get("submit_with_modifier", False))
+        s.set("submit_with_modifier", not cur)
+        sublime.save_settings("ClaudeCode.sublime-settings")
+        mode = "Cmd/Ctrl+Enter" if not cur else "Enter"
+        sublime.status_message(f"Claude: submit with {mode}")
+
+    def is_checked(self):
+        return bool(sublime.load_settings("ClaudeCode.sublime-settings")
+                    .get("submit_with_modifier", False))
+
+
 class ClaudeToggleAutoSleepCommand(sublime_plugin.WindowCommand):
     """Toggle auto-sleep for the active session."""
     def run(self):
@@ -1162,6 +1193,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         has_codex = backends.is_available("codex")
         has_copilot = backends.is_available("copilot")
         has_deepseek = backends.is_available("deepseek")
+        has_pi = backends.is_available("pi")
 
         project_path = self.window.folders()[0] if self.window.folders() else None
         starred = load_bookmarks(project_path)
@@ -1319,6 +1351,8 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             other_backends.append("copilot")
         if has_deepseek and backend != "deepseek":
             other_backends.append("deepseek")
+        if has_pi and backend != "pi":
+            other_backends.append("pi")
         if backend != "claude":
             other_backends.append("claude")
         for other in other_backends:

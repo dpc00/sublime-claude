@@ -440,6 +440,15 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                     return True
             return False
 
+        if key == "claude_submit_with_modifier":
+            val = bool(sublime.load_settings("ClaudeCode.sublime-settings")
+                       .get("submit_with_modifier", False))
+            if operator == sublime.OP_EQUAL:
+                return val == bool(operand)
+            if operator == sublime.OP_NOT_EQUAL:
+                return val != bool(operand)
+            return None
+
         return None
 
     _in_soft_undo = False

@@ -34,6 +34,12 @@
     // Environment variables passed to bridge process
     // "env": {},
 
+    // Submit key in input mode.
+    //   false (default): Enter submits, Shift+Enter inserts newline.
+    //   true:            Cmd+Enter / Ctrl+Enter submits, Enter inserts newline.
+    // Toggle from command palette: "Claude: Toggle Submit Key".
+    "submit_with_modifier": false,
+
     // Profiles and checkpoints are stored in separate files:
     //   User-level:    ~/.claude-sublime/profiles.json
     //   Project-level: {project}/.claude/profiles.json

@@ -205,13 +205,15 @@ class Bridge:
                      "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK")}
         _logger.info(f"  env (masked) = {env_view}")
 
-        # Build system prompt with project addon
-        system_prompt = params.get("system_prompt", "")
+        # Build the addon text (session info, project addon, subsession guide).
+        # Profile-supplied system_prompt is treated as a full replacement
+        # (user intent — they're overriding Claude Code's default prompt).
+        # Otherwise we use the `claude_code` preset with `append`, which
+        # preserves Claude Code's <env> block (cwd, additional working dirs,
+        # platform, date, etc.) — losing that was why add_dirs looked broken.
+        profile_system_prompt = params.get("system_prompt", "")
         addon = settings.get("system_prompt_addon")
-        if addon:
-            system_prompt = (system_prompt + "\n\n" + addon) if system_prompt else addon
 
-        # Add session info to system prompt
         session_id_info = f"sublime.{session_id}"
         view_id_info = view_id or session_id
         session_guide = f"""
@@ -221,22 +223,43 @@ class Bridge:
 Session ID: {session_id_info}
 View ID: {view_id_info}
 """
-        system_prompt = (system_prompt + session_guide) if system_prompt else session_guide
 
-        # If this is a subsession, store subsession_id and add specific guidance
         subsession_id = params.get("subsession_id")
         self._subsession_id = subsession_id  # Store for signal_complete tool
+        subsession_guide = ""
         if subsession_id:
             subsession_guide = f"""
 You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id_info}, result_summary="...") when done.
 """
-            system_prompt += subsession_guide
+
+        if profile_system_prompt:
+            # Profile wants full replacement; concatenate our pieces onto it.
+            parts = [profile_system_prompt]
+            if addon:
+                parts.append(addon)
+            parts.append(session_guide)
+            if subsession_guide:
+                parts.append(subsession_guide)
+            system_prompt_value = "\n\n".join(parts)
+        else:
+            # Keep Claude Code's default prompt (env, cwd, add-dirs) and append ours.
+            append_parts = []
+            if addon:
+                append_parts.append(addon)
+            append_parts.append(session_guide)
+            if subsession_guide:
+                append_parts.append(subsession_guide)
+            system_prompt_value = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": "\n\n".join(append_parts),
+            }
 
         options_dict = {
             "allowed_tools": params.get("allowed_tools", []),
             "permission_mode": params.get("permission_mode", "default"),
             "cwd": cwd,
-            "system_prompt": system_prompt,
+            "system_prompt": system_prompt_value,
             "can_use_tool": self.can_use_tool,
             "resume": resume_id,
             "fork_session": fork_session,
@@ -274,20 +297,26 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         if plugins:
             options_dict["plugins"] = plugins
 
-        # For fresh sessions (not resuming), specify session_id upfront via CLI arg
-        # This avoids waiting for first query to get session_id from ResultMessage
+        # Additional working directories. MUST go through ClaudeAgentOptions.add_dirs,
+        # not extra_args — extra_args is typed `dict[str, str | None]` and the SDK
+        # does `str(value)` on it, so a list becomes "['/path1', '/path2']" passed
+        # as ONE bad --add-dir arg. The proper add_dirs path emits --add-dir once
+        # per path. Also: always pass them, regardless of fresh-vs-resume.
+        additional_dirs = params.get("additional_dirs", [])
+        if additional_dirs:
+            options_dict["add_dirs"] = list(additional_dirs)
+
+        extra_args: dict = {}
         if not resume_id:
-            extra_args = {"session-id": session_id}
-            # Add additional working directories from Sublime project folders
-            additional_dirs = params.get("additional_dirs", [])
-            if additional_dirs:
-                extra_args["add-dir"] = additional_dirs
-            options_dict["extra_args"] = extra_args
+            # Fresh session: specify session_id upfront via CLI arg so we don't
+            # have to wait for the first ResultMessage to learn it.
+            extra_args["session-id"] = session_id
         else:
-            # Resume mode — check for rewind point
             resume_session_at = params.get("resume_session_at")
             if resume_session_at:
-                options_dict["extra_args"] = {"resume-session-at": resume_session_at}
+                extra_args["resume-session-at"] = resume_session_at
+        if extra_args:
+            options_dict["extra_args"] = extra_args
 
         self.options = ClaudeAgentOptions(**options_dict)
         self.client = ClaudeSDKClient(options=self.options)
@@ -295,6 +324,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         try:
             _logger.info(f"  connecting SDK with model={options_dict.get('model')!r} "
                          f"resume={options_dict.get('resume')!r} "
+                         f"add_dirs={options_dict.get('add_dirs')} "
                          f"extra_args={options_dict.get('extra_args')}")
             await self.client.connect()
             _logger.info("  SDK connect OK")

@@ -12,6 +12,10 @@
         "command": "copilot_start"
     },
     {
+        "caption": "Pi: New Session",
+        "command": "pi_start"
+    },
+    {
         "caption": "Claude: Query Selection",
         "command": "claude_code_query_selection"
     },
@@ -197,6 +201,10 @@
     {
         "caption": "Claude: Toggle Auto-Sleep for This Session",
         "command": "claude_toggle_auto_sleep"
+    },
+    {
+        "caption": "Claude: Toggle Submit Key (Enter / Cmd+Enter)",
+        "command": "claude_toggle_submit_mode"
     },
     {
         "caption": "Claude: Sleep Session",

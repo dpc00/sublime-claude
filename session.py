@@ -253,14 +253,20 @@ class Session:
 
         print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, default_model={default_model}, subsession_id={getattr(self, 'subsession_id', None)}")
         # Get additional working directories from project folders + project settings
-        additional_dirs = self.window.folders()[1:] if len(self.window.folders()) > 1 else []
+        all_folders = self.window.folders()
+        secondary_folders = all_folders[1:] if len(all_folders) > 1 else []
+        additional_dirs = list(secondary_folders)
         project_data = self.window.project_data() or {}
         project_settings = project_data.get("settings", {})
         extra_dirs = project_settings.get("claude_additional_dirs", [])
+        expanded_extras = []
         if extra_dirs:
-            expanded = [os.path.expanduser(d) for d in extra_dirs]
-            additional_dirs = additional_dirs + expanded
-            print(f"[Claude] extra additional_dirs from project: {expanded}")
+            expanded_extras = [os.path.expanduser(d) for d in extra_dirs]
+            additional_dirs = additional_dirs + expanded_extras
+        print(f"[Claude] additional_dirs sources: cwd={all_folders[0] if all_folders else None!r} "
+              f"secondary_folders={secondary_folders} "
+              f"claude_additional_dirs={expanded_extras} "
+              f"→ sending {len(additional_dirs)} dirs: {additional_dirs}")
         init_params = {
             "cwd": self._cwd(),
             "additional_dirs": additional_dirs,

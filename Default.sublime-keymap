@@ -105,12 +105,14 @@
             { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
     },
+    // Submit on Enter (default mode: submit_with_modifier=false)
     {
         "keys": ["enter"],
         "command": "claude_submit_input",
         "context": [
             { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true }
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
+            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": false }
         ]
     },
     {
@@ -118,9 +120,57 @@
         "command": "claude_submit_input",
         "context": [
             { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_sleeping", "operator": "equal", "operand": true }
+            { "key": "setting.claude_sleeping", "operator": "equal", "operand": true },
+            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": false }
         ]
     },
+    // Modifier+Enter mode: Enter inserts newline, Cmd/Ctrl+Enter submits
+    {
+        "keys": ["enter"],
+        "command": "claude_insert_newline",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
+            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+enter"],
+        "command": "claude_submit_input",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
+            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["ctrl+enter"],
+        "command": "claude_submit_input",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
+            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+enter"],
+        "command": "claude_submit_input",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_sleeping", "operator": "equal", "operand": true },
+            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["ctrl+enter"],
+        "command": "claude_submit_input",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_sleeping", "operator": "equal", "operand": true },
+            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
+        ]
+    },
+    // Shift+Enter always inserts newline (harmless in modifier mode where Enter already does)
     {
         "keys": ["shift+enter"],
         "command": "claude_insert_newline",
