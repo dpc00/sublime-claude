@@ -28,6 +28,11 @@ _logger = get_bridge_logger()
 # Set env var so child processes (bash commands) can detect they're running under Claude agent
 os.environ["CLAUDE_AGENT"] = "1"
 
+# task_updated.patch.status values that mean the task ended. (The SDK dropped
+# the old `is_backgrounded` patch flag for a {status, end_time} patch.)
+_TASK_TERMINAL = ("completed", "failed", "cancelled", "canceled",
+                  "error", "errored", "aborted", "timeout", "crashed")
+
 from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
@@ -929,8 +934,12 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                         task_id = data.get("task_id", "")
                         if tool_use_id in self._bg_tool_use_ids:
                             self._pending_bg_tasks.add(task_id)
-                    elif message.subtype == "task_updated" and (data.get("patch") or {}).get("is_backgrounded"):
-                        self._pending_bg_tasks.add(data.get("task_id", ""))
+                    elif message.subtype == "task_updated":
+                        # Schema drift: patch is {status, end_time} now (no
+                        # is_backgrounded). A terminal status means the task
+                        # ended — drop it so _pending_bg_tasks tracks RUNNING.
+                        if (data.get("patch") or {}).get("status", "") in _TASK_TERMINAL:
+                            self._pending_bg_tasks.discard(data.get("task_id", ""))
                     elif message.subtype == "task_notification":
                         self._pending_bg_tasks.discard(data.get("task_id", ""))
                 if not turn_done:
@@ -1182,13 +1191,19 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                         data = msg.data or {}
                         if msg.subtype == "task_notification":
                             self._pending_bg_tasks.discard(data.get("task_id", ""))
+                        elif msg.subtype == "task_updated" and \
+                                (data.get("patch") or {}).get("status", "") in _TASK_TERMINAL:
+                            self._pending_bg_tasks.discard(data.get("task_id", ""))
                         await self.emit_message(msg)
                 except (asyncio.TimeoutError, StopAsyncIteration):
                     break
         except Exception as e:
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"poll_bg_tasks error: {e}\n")
-        send_result(rpc_id, {"pending": len(self._pending_bg_tasks), "checked": checked})
+        # `running` lets the plugin reconcile bg tools whose completion event it
+        # missed: any tracked task_id no longer here has ended.
+        send_result(rpc_id, {"pending": len(self._pending_bg_tasks), "checked": checked,
+                             "running": list(self._pending_bg_tasks)})
 
     async def get_history(self, id: int) -> None:
         """Get conversation history from the SDK."""

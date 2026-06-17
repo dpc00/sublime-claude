@@ -134,6 +134,20 @@ class Session:
         # the object alive so the ⚙ → ✓/✗ symbol patch can still happen
         # after the owning Conversation has been dropped.
         self._bg_tools: Dict[str, Any] = {}
+        # Tool-use ids known to be run_in_background — the agent-wake gate. Kept
+        # separate from _bg_tools (the visual registry) so the reliable
+        # task_updated cleanup can finalize the ⚙ line without suppressing the
+        # later task_notification wake.
+        self._bg_task_ids: set = set()
+        # Task ids we've seen in the bridge's running set — so reconciliation
+        # only finalizes a bg task that was observed running and then vanished
+        # (a missed terminal event), never one that simply hasn't started yet.
+        self._seen_running: set = set()
+        # Workflow (ultracode) live state: task_id -> {wp, summary, sig}. The
+        # bridge forwards task_progress every tick with a workflow_progress[]
+        # tree; we render it as a live panel.
+        self._workflows: Dict[str, Any] = {}
+        self._workflow_phantom_set = None
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
         # Callback for channel mode responses
@@ -1297,6 +1311,7 @@ class Session:
                     continue
                 self.output.remove_tool(tool)
             self._bg_tools.clear()
+            self._bg_task_ids.clear()
             if bg:
                 print(f"[Claude] dropped {len(bg)} aborted background tool(s): {reason}")
         except Exception as e:
@@ -1693,6 +1708,7 @@ class Session:
                 tc = self.output.find_tool_by_id(tool_id)
                 if tc is not None:
                     self._bg_tools[tool_id] = tc
+                self._bg_task_ids.add(tool_id)
             self._update_status_bar()
             return
         if self.current_tool and self.current_tool.strip():
@@ -1754,6 +1770,8 @@ class Session:
             print(f"[Claude] usage: {usage}")
         self.output.meta(dur, cost, usage=usage)
         self._update_status_bar()
+        # A workflow runs within a turn; the live panel is a during-turn overlay.
+        self._clear_workflow_panel()
 
     def _on_msg_system(self, params: dict) -> None:
         """Dispatch system messages by subtype."""
@@ -1762,6 +1780,7 @@ class Session:
             "task_started": self._on_sys_task_started,
             "task_updated": self._on_sys_task_updated,
             "task_notification": self._on_sys_task_notification,
+            "task_progress": self._on_sys_task_progress,
         }
         h = handlers.get(params.get("subtype", ""))
         if h is not None:
@@ -1774,6 +1793,29 @@ class Session:
         self._update_status_bar()
         self._inject_retain_midquery()
 
+    # task_updated.patch.status / task_notification.status values that mean the
+    # task is over (the SDK schema dropped the old `is_backgrounded` patch flag
+    # in favour of a status patch — see docs/… and the bridge log).
+    _TASK_TERMINAL = ("completed", "failed", "cancelled", "canceled",
+                      "error", "errored", "aborted", "timeout", "crashed")
+
+    def _finalize_bg_tool(self, tool_use_id: str, keep: bool) -> None:
+        """Visually finalize a background tool line — idempotent. `keep` → flip
+        ⚙ to ✓ (a real result worth keeping); else remove the line as noise.
+        Safe to call from both task_updated and task_notification."""
+        from .output import BACKGROUND, DONE
+        tool = self._bg_tools.get(tool_use_id) or self.output.find_tool_by_id(tool_use_id)
+        if tool is None or tool.status != BACKGROUND:
+            return  # already finalized (or never a live ⚙) — nothing to do
+        if keep:
+            tool.status = DONE
+            if self.output._is_in_current(tool):
+                self.output._render_current()
+            else:
+                self.output._patch_tool_symbol(tool, BACKGROUND)
+        else:
+            self.output.remove_tool(tool)
+
     def _on_sys_task_started(self, data: dict) -> None:
         task_id = data.get("task_id", "")
         tool_use_id = data.get("tool_use_id", "")
@@ -1782,27 +1824,22 @@ class Session:
             self._schedule_bg_poll()
 
     def _on_sys_task_updated(self, data: dict) -> None:
+        # The SDK task schema changed: `patch` now carries {status, end_time}
+        # (no more `is_backgrounded`). A terminal status here is the RELIABLE
+        # completion signal — it fires even when a task_notification doesn't
+        # (e.g. a task killed out-of-band), so it's the primary cleanup path.
         task_id = data.get("task_id", "")
-        patch = data.get("patch", {})
-        if not patch.get("is_backgrounded"):
+        status = (data.get("patch") or {}).get("status", "")
+        if not task_id or status not in self._TASK_TERMINAL:
             return
-        tool_use_id = self._task_tool_map.get(task_id)
+        tool_use_id = self._task_tool_map.pop(task_id, None)
         if not tool_use_id:
             return
-        tool = self.output.find_tool_by_id(tool_use_id)
-        if tool and tool.status != "background":
-            from .output import BACKGROUND
-            tool.status = BACKGROUND
-            # Register so the completion task_notification can flip ⚙ → ✓/✗.
-            # Tools backgrounded *here* (mid-run, via is_backgrounded) — not at
-            # tool_use time — were otherwise missing from _bg_tools, so their
-            # notification hit the `not in _bg_tools` gate and was dropped,
-            # leaving the tool stuck on ⚙ ("live") forever.
-            self._bg_tools[tool_use_id] = tool
-            if self.output._is_in_current(tool):
-                self.output._render_current()
-            else:
-                self.output._patch_tool_symbol(tool, "pending")
+        # No output_file on task_updated → keep a completed line as ✓, drop the
+        # rest. A leading task_notification (which has output) may already have
+        # finalized it; _finalize_bg_tool is idempotent. Leave _bg_task_ids so
+        # the notification can still wake the agent.
+        self._finalize_bg_tool(tool_use_id, keep=(status == "completed"))
 
     def _on_sys_task_notification(self, data: dict) -> None:
         task_id = data.get("task_id", "")
@@ -1812,14 +1849,12 @@ class Session:
         self._task_tool_map.pop(task_id, None)
         if not status or not tool_use_id:
             return
-        # Authoritative gate: only fire wake for tools we know were started
-        # with run_in_background=true. Survives conversation-history truncation
-        # so a bg task that finishes much later still notifies the agent.
-        if tool_use_id not in self._bg_tools:
+        # Authoritative gate: only wake for tools we know were run_in_background.
+        # _bg_task_ids (not _bg_tools) survives the task_updated cleanup, so the
+        # wake fires regardless of which terminal event arrives first.
+        if tool_use_id not in self._bg_task_ids:
             return
-        # Pop the ToolCall reference; prefer it over find_tool_by_id, which
-        # returns None after HISTORY_CAP drops the owning Conversation.
-        tool = self._bg_tools.pop(tool_use_id) or self.output.find_tool_by_id(tool_use_id)
+        self._bg_task_ids.discard(tool_use_id)
         # Read output first — it decides whether the tool line is worth keeping.
         output = ""
         output_file = data.get("output_file", "")
@@ -1829,15 +1864,9 @@ class Session:
                     output = f.read().strip()
             except Exception as e:
                 print(f"[Claude] task notification output read failed ({output_file}): {e}")
-        if tool and tool.status == "background":
-            from .output import DONE
-            if status == "completed" and output:
-                old_status = tool.status
-                tool.status = DONE  # ✓ — a real result worth keeping
-                self.output._patch_tool_symbol(tool, old_status)
-            else:
-                # Failed, or completed with no surfaced output → drop the noise.
-                self.output.remove_tool(tool)
+        # Keep ✓ only for a completed task with a real surfaced result.
+        self._finalize_bg_tool(tool_use_id, keep=(status == "completed" and bool(output)))
+        self._bg_tools.pop(tool_use_id, None)
         summary = data.get("summary", "")
         header = f"{summary} [{status}]" if status != "completed" else summary
         block = (
@@ -1867,6 +1896,123 @@ class Session:
         else:
             self.query(wake_prompt, display_prompt=display, silent=True)
 
+    # ── workflow (ultracode) live panel ──────────────────────────────────────
+    # state → glyph. start/queued/progress confirmed from the live bridge log;
+    # the failure/cancel set is defensive (real strings still unconfirmed — a
+    # succeeding run never emits them), unknown → neutral '?'.
+    _WF_GLYPH = {"start": "○", "queued": "○", "progress": "◐", "running": "◐",
+                 "done": "✔", "completed": "✔", "success": "✔",
+                 "failed": "✘", "error": "✘", "errored": "✘", "crashed": "✘",
+                 "cancelled": "⊘", "canceled": "⊘", "aborted": "⊘", "timeout": "⊘"}
+    _WF_DONE = ("done", "completed", "success")
+
+    @staticmethod
+    def _wf_tokens(n) -> str:
+        try:
+            n = int(n or 0)
+        except Exception:
+            return "0"
+        return f"{n/1000:.1f}k" if n >= 1000 else str(n)
+
+    @staticmethod
+    def _wf_model(m: str) -> str:
+        if not m:
+            return ""
+        for k in ("opus", "sonnet", "haiku", "fable"):
+            if k in m:
+                return k
+        return m.split("-")[0][:8]
+
+    def _on_sys_task_progress(self, data: dict) -> None:
+        """Live ultracode workflow progress. The workflow_progress[] tree mixes
+        `workflow_phase` ({index,title}) and `workflow_agent` entries; render a
+        live per-phase/per-agent panel. High-frequency + full re-snapshot each
+        tick, so suppress no-op ticks (only timers moved)."""
+        task_id = data.get("task_id", "")
+        wp = data.get("workflow_progress") or []
+        if not task_id or not wp:
+            return
+        agents = [a for a in wp if isinstance(a, dict) and a.get("type") == "workflow_agent"]
+        if not agents:
+            return
+        sig = tuple((a.get("phaseIndex"), a.get("index"), a.get("state"),
+                     a.get("toolCalls"), a.get("lastToolName")) for a in agents)
+        prev = self._workflows.get(task_id)
+        if prev and prev.get("sig") == sig:
+            return  # nothing material changed — let the spinner cover elapsed
+        self._workflows[task_id] = {"wp": wp, "summary": data.get("summary", ""), "sig": sig}
+        if all(a.get("state") in self._WF_DONE for a in agents):
+            self._clear_workflow_panel()  # minimal: live panel vanishes on completion
+            return
+        self._render_workflow_panel(self._build_workflow_html(wp, data.get("summary", "")))
+
+    @classmethod
+    def _build_workflow_html(cls, wp: list, summary: str) -> str:
+        import time as _t
+        def esc(s):
+            return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        phases, agents = {}, []
+        for e in wp:
+            if not isinstance(e, dict):
+                continue
+            if e.get("type") == "workflow_phase":
+                phases[e.get("index")] = e.get("title") or ""
+            elif e.get("type") == "workflow_agent":
+                agents.append(e)
+        total = sum(int(a.get("tokens") or 0) for a in agents)
+        done = sum(1 for a in agents if a.get("state") in cls._WF_DONE)
+        starts = [a.get("startedAt") for a in agents if a.get("startedAt")]
+        elapsed = ""
+        if starts:
+            secs = max(0, int(_t.time() * 1000 - min(starts)) // 1000)
+            elapsed = f" · {secs//60}m{secs%60:02d}s" if secs >= 60 else f" · {secs}s"
+        dim = "color:color(var(--foreground) alpha(0.55))"
+        head = (f'<div style="font-weight:bold">▼ {esc(summary)[:48]} · '
+                f'{done}/{len(agents)} agents · {cls._wf_tokens(total)} tok{elapsed}</div>')
+        rows = [head]
+        by_phase = {}
+        for a in agents:
+            by_phase.setdefault(a.get("phaseIndex"), []).append(a)
+        for pidx in sorted(by_phase, key=lambda x: (x is None, x)):
+            title = phases.get(pidx, "")
+            if title:
+                rows.append(f'<div style="{dim}">{esc(title)}</div>')
+            for a in sorted(by_phase[pidx], key=lambda x: x.get("index") or 0):
+                g = cls._WF_GLYPH.get(a.get("state"), "?")
+                model = cls._wf_model(a.get("model"))
+                if a.get("state") in cls._WF_DONE:
+                    act = ""
+                else:
+                    act = f'{esc(a.get("lastToolName"))} {esc(a.get("lastToolSummary"))[:40]}'.strip()
+                meta = f'{a.get("toolCalls") or 0}t {cls._wf_tokens(a.get("tokens"))}'
+                rows.append(
+                    f'<div>&nbsp;&nbsp;{g} {esc(a.get("label"))[:22]} '
+                    f'<i style="{dim}">{model}</i> {esc(act)} '
+                    f'<span style="{dim}">{meta}</span></div>')
+        return "".join(rows)
+
+    def _get_workflow_phantom_set(self):
+        if self._workflow_phantom_set is None and self.output and self.output.view:
+            self._workflow_phantom_set = sublime.PhantomSet(self.output.view, "claude_workflow")
+        return self._workflow_phantom_set
+
+    def _render_workflow_panel(self, html_body: str) -> None:
+        ps = self._get_workflow_phantom_set()
+        if not ps or not self.output or not self.output.view:
+            return
+        view = self.output.view
+        content = view.substr(sublime.Region(0, view.size()))
+        last_nl = content.rfind("\n")
+        pt = last_nl if last_nl >= 0 else 0
+        html = (f'<body style="margin:6px 0; padding:2px 8px; '
+                f'background-color:color(var(--background) blend(var(--foreground) 96%));">{html_body}</body>')
+        ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
+
+    def _clear_workflow_panel(self) -> None:
+        ps = self._get_workflow_phantom_set()
+        if ps:
+            ps.update([])
+
     def _schedule_bg_poll(self) -> None:
         """Start bg-task poll timer if not already running."""
         if self._bg_poll_timer is not None or not self._task_tool_map:
@@ -1889,8 +2035,35 @@ class Session:
         pending = result.get("pending", 0)
         if checked:
             print(f"[Claude] bg_poll: checked={checked} pending_bridge={pending} pending_plugin={len(self._task_tool_map)}")
+        self._reconcile_bg_tools(result.get("running"))
         if self._task_tool_map:
             self._bg_poll_timer = sublime.set_timeout(self._bg_poll, 8000)
+
+    def _reconcile_bg_tools(self, running=None) -> None:
+        """Memory hygiene + missed-event recovery.
+
+        Always drops registry entries whose ⚙ line was already finalized. When
+        the bridge reports its live-task set (`running`), also finalizes any
+        tracked background task that we *saw* running and which has since
+        vanished — i.e. it ended without a terminal event reaching us (the only
+        case the task_updated path can't catch)."""
+        from .output import BACKGROUND
+        for tid in list(self._bg_tools):
+            tool = self._bg_tools.get(tid)
+            if tool is None or tool.status != BACKGROUND:
+                self._bg_tools.pop(tid, None)
+        if running is None:
+            return
+        live = set(running)
+        self._seen_running |= live
+        for task_id, tool_use_id in list(self._task_tool_map.items()):
+            if (tool_use_id in self._bg_task_ids
+                    and task_id in self._seen_running and task_id not in live):
+                self._finalize_bg_tool(tool_use_id, keep=False)
+                self._task_tool_map.pop(task_id, None)
+                self._bg_task_ids.discard(tool_use_id)
+                self._bg_tools.pop(tool_use_id, None)
+                self._seen_running.discard(task_id)
 
     def _set_name(self, name: str) -> None:
         """Set session name and update UI."""

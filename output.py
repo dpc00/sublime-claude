@@ -664,13 +664,17 @@ class OutputView:
             new_status = tool_input.get("status")
             new_subject = tool_input.get("subject")
             if tid:
-                for todo in self.current.todos:
-                    if todo.id == tid:
-                        if new_status:
-                            todo.status = new_status
-                        if new_subject:
-                            todo.content = new_subject
-                        break
+                if new_status == "deleted":
+                    # A deleted task should leave the list, not linger as ○.
+                    self.current.todos = [t for t in self.current.todos if t.id != tid]
+                else:
+                    for todo in self.current.todos:
+                        if todo.id == tid:
+                            if new_status:
+                                todo.status = new_status
+                            if new_subject:
+                                todo.content = new_subject
+                            break
 
         self._render_current()
 
@@ -852,7 +856,9 @@ class OutputView:
                     status=it.get("status") or "pending",
                     id=str(it.get("id") or ""),
                 )
-                for it in parsed_items if (it.get("subject") or it.get("id"))
+                # Require real text — an id-only parse ("+" etc.) is garbage and
+                # would render as a blank ○.
+                for it in parsed_items if (it.get("subject") or it.get("content"))
             ]
             if self.current.todos and all(t.status == "completed" for t in self.current.todos):
                 self.current.todos_all_done = True
@@ -2155,10 +2161,12 @@ class OutputView:
             spinner = SPINNER_FRAMES[self._spinner_frame % len(SPINNER_FRAMES)]
             lines.append(f"  {spinner}\n")
 
-        # Todo list (if any)
-        if self.current.todos:
+        # Todo list (if any) — only real, non-deleted items; never an empty block.
+        visible_todos = [t for t in self.current.todos
+                         if t.content.strip() and t.status != "deleted"]
+        if visible_todos:
             lines.append("\n  ───── Tasks ─────\n")
-            for todo in self.current.todos:
+            for todo in visible_todos:
                 if todo.status == "completed":
                     icon = "✓"
                 elif todo.status == "in_progress":
@@ -2167,7 +2175,7 @@ class OutputView:
                     icon = "○"
                 lines.append(f"  {icon} {todo.content}\n")
             # Mark as done so next conversation starts fresh
-            if all(t.status == "completed" for t in self.current.todos):
+            if all(t.status == "completed" for t in visible_todos):
                 self.current.todos_all_done = True
 
         # Meta
