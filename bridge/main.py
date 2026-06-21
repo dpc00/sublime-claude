@@ -1428,7 +1428,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
     async def run(self) -> None:
         """Main loop - read JSON-RPC from stdin."""
         # Immediate startup log
-        sys.stderr.write("=== BRIDGE STARTING WITH 1GB BUFFER ===\n")
+        sys.stderr.write("=== BRIDGE STARTING (thread-based stdin reader) ===\n")
         sys.stderr.flush()
 
         import threading
